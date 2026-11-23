@@ -8,6 +8,7 @@ from __future__ import annotations
 import datetime
 import math
 import random
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -525,6 +526,23 @@ def _report_generate(catalog_name: str, index_no: str, effects: list[FlowEffect]
 
 # ============================ 链路9: 质量规则→特征监控→特征报告 ============================
 
+# 同一阻断并发提交时串行化：保证只记一次监控事件、只生成一份异常报告，
+# 报表并发生成时也不会重复消费同一个仍待处理的报表切片。
+_QUALITY_BLOCK_LOCK = threading.Lock()
+
+
+def _feature_tokens(raw: Any) -> set[str]:
+    """把特征字段拆成精确特征名集合。
+
+    兼容历史单目标监控（整段即一个特征名），也支持 `;` `,` `、` 分隔的多目标
+    写法；按完整特征名精确匹配，名称前缀相同的不同特征（如 refund 与
+    refund_sum）不会互相命中，避免告警残留。
+    """
+    text = str(raw or "")
+    for sep in (";", "；", ",", "，", "、"):
+        text = text.replace(sep, " ")
+    return {token.strip() for token in text.split() if token.strip()}
+
 
 @_register(
     "quality_rule/确认阻断 → feature_mon/确认漂移 → report_task/启动生成",
@@ -538,36 +556,65 @@ def flow_quality_to_mon_to_report(quality_rule_id: int) -> list[FlowEffect]:
 
     rule_no = str(qr.get("规则编号", ""))
     target_feat = str(qr.get("目标特征", ""))
+    blocked_feats = _feature_tokens(target_feat)
+    if not blocked_feats:
+        return effects
+    block_source = f"quality_rule/{rule_no}"
 
-    # 联动特征监控确认漂移
-    mon_rows = store.rows("feature_mon")
-    for mrow in mon_rows:
-        if target_feat in str(mrow.get("目标特征", "")) and mrow.get("status") == "监控中":
+    with _QUALITY_BLOCK_LOCK:
+        # 联动特征监控确认漂移：精确命中被阻断特征的全部在监控切片；
+        # 同一目标可有多条监控中规则，未命中阻断特征的切片继续运行不受影响。
+        mon_rows = store.rows("feature_mon")
+        marked: list[dict[str, Any]] = []
+        for mrow in mon_rows:
+            if mrow.get("status") != "监控中":
+                continue
+            if not (_feature_tokens(mrow.get("目标特征", "")) & blocked_feats):
+                continue
+            if mrow.get("triggered_by") == block_source:
+                continue  # 同一阻断重复提交：该切片已记过监控事件
+            marked.append(mrow)
+
+        # 生成异常报告：只消费仍待处理（草稿）的报表切片，保留触发来源；
+        # 同一阻断已生成过报告则复用结论，不重复生成。
+        report_rows = store.rows("report_task")
+        report_row = next(
+            (r for r in report_rows if r.get("triggered_by") == block_source), None)
+        report_created = False
+        if report_row is None:
+            for rrow in report_rows:
+                if rrow.get("status") == "草稿":
+                    rrow["status"] = "已生成"
+                    rrow["pending"] = False
+                    rrow["报告类型"] = "质量异常报告"
+                    rrow["特征范围"] = target_feat
+                    rrow["最近生成"] = datetime.datetime.now().isoformat()
+                    rrow["triggered_by"] = block_source
+                    report_row = rrow
+                    report_created = True
+                    break
+        report_no = str(report_row.get("报告编号", "")) if report_row else ""
+
+        # 阻断结论同步到监控清单：消费质量监控明细更新实际检测记录
+        today = datetime.date.today().isoformat()
+        for mrow in marked:
             mrow["status"] = "分布漂移"
             mrow["pending"] = True
+            mrow["最近检测"] = today
             mrow["漂移方向"] = "正向偏移(质量阻断触发)"
-            mrow["triggered_by"] = f"quality_rule/{rule_no}"
+            mrow["triggered_by"] = block_source
+            if report_no:
+                mrow["关联报告"] = report_no
             effects.append(FlowEffect(
                 "确认漂移", "feature_mon", int(mrow.get("id", 0)),
                 f"质量规则 {rule_no} 阻断后联动监控 {mrow.get('规则编号','')} 标记分布漂移",
             ))
-            break
 
-    # 生成异常报告
-    report_rows = store.rows("report_task")
-    for rrow in report_rows:
-        if rrow.get("status") == "草稿":
-            rrow["status"] = "已生成"
-            rrow["pending"] = False
-            rrow["报告类型"] = "质量异常报告"
-            rrow["特征范围"] = target_feat
-            rrow["最近生成"] = datetime.datetime.now().isoformat()
-            rrow["triggered_by"] = f"quality_rule/{rule_no}"
+        if report_created:
             effects.append(FlowEffect(
-                "启动生成", "report_task", int(rrow.get("id", 0)),
-                f"质量规则 {rule_no} 阻断后生成异常报告 {rrow.get('报告编号','')}",
+                "启动生成", "report_task", int(report_row.get("id", 0)),
+                f"质量规则 {rule_no} 阻断后生成异常报告 {report_row.get('报告编号','')}",
             ))
-            break
 
     return effects
 
